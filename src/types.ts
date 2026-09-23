@@ -42,6 +42,13 @@ export interface UuycConfig {
    * ⚠️ 该值会进入 cordis.yml 与对话记录，使用后应提醒用户修改密码。
    */
   password: string
+  /**
+   * 终端握手失败（handshakeUnavailable）时的最大重试次数。握手失败通常是被控端
+   * 没有活跃终端会话 / P2P 刚重启，退避重试往往能自愈。默认 1（即总共尝试 2 次）。
+   */
+  handshakeRetries: number
+  /** 握手重试的退避基数（毫秒），第 n 次重试等待 backoffMs * n。 */
+  handshakeBackoffMs: number
 }
 
 /** 一次远程命令执行的结果。 */
@@ -54,4 +61,9 @@ export interface UuycExecResult {
   locked?: boolean
   /** 终端握手失败：被控端无活跃终端会话 / 版本不匹配 / P2P 未就绪，需用户在远端打开一个 UU 终端窗口。 */
   handshakeUnavailable?: boolean
+  /**
+   * 远程终端桥不可用（terminal_bridge_unavailable）：多见于向不支持的 shell（如 cmd）
+   * 发起会话。命中后工具层会自动回退到受支持的默认 shell（powershell）。
+   */
+  bridgeUnavailable?: boolean
 }
