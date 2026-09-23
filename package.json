@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-uuyc",
   "version": "0.1.6",
-  "description": "UU 远程 (uuyc-cli) 远程 Windows 控制插件：设备管理与远程终端执行，供本地 agent 调用。",
+  "description": "UU remote (uuyc-cli) Windows remote-control plugin for deepseek-harness: device management and remote terminal execution for local agents.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
