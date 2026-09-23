@@ -12,3 +12,5 @@
         controlTimeoutMs: 15000
         sessionIdleTtlMs: 600000
         password: ''
+        handshakeRetries: 1
+        handshakeBackoffMs: 1500
