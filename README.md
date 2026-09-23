@@ -75,18 +75,28 @@ The model-visible tool `uuyc_terminal`, dispatched by `action`:
   name: '@deepseek-ai/dsh-uuyc'
   disabled: !!js process.platform !== 'win32'   # enable only on Windows host
   config:
-    cliPath: ''                  # empty → auto-detect D:\uu / D:\Netease / C:\Program Files\Netease etc.
+    cliPath: ''                  # empty → auto-detect via PATH (`where`), running GameViewer.exe, then known install dirs
     defaultShell: powershell      # powershell | cmd
     execTimeoutMs: 120000
     controlTimeoutMs: 15000
     sessionIdleTtlMs: 600000
     password: ''                 # optional: unlock password for locked devices, sent as first stdin line
+    handshakeRetries: 1          # auto retry on handshake failure (total attempts = 1 + retries)
+    handshakeBackoffMs: 1500     # backoff base (ms); nth retry waits backoffMs * n
 ```
+
+### Workflow hardening (built in)
+
+- **CLI auto-discovery** — when `cliPath` is empty, the plugin probes in order: explicit config → `where uuyc-cli.exe` on PATH → the `bin\uuyc-cli.exe` next to the running `GameViewer.exe` process → a list of well-known install directories (`D:\uu`, `D:\Netease`, `C:\Program Files\NetEase`, …). You usually never need to set `cliPath`.
+- **Device-list cache + fuzzy matching** — `device list` results are cached for 60s; `target` accepts a device name or ID and matches case-insensitively, with a substring fuzzy match. If the fuzzy match hits more than one device, the plugin lists the candidates instead of guessing.
+- **Handshake auto-retry** — on `handshakeUnavailable` the plugin backs off and retries up to `handshakeRetries` times (handshake failures are usually transient — no active terminal on the controlled end, or a just-restarted P2P link).
+- **Shell auto-fallback** — if the default `powershell` keeps failing the handshake, the plugin retries once on `cmd`; if `cmd` triggers `terminal_bridge_unavailable`, it falls back to the supported `powershell`.
 
 ## Troubleshooting: locked screen / handshake failure
 
 - **Locked screen**: when the controlled endpoint is locked, `term` interactively asks for the unlock password. Two options: (1) unlock the screen on the remote first; (2) set `password` in config and the plugin sends it as the first stdin line. If neither, uuyc waits for the password on the PTY and the plugin times out (no crash, retry-able) — this is the expected graceful failure.
-- **Terminal handshake failure ("controlled endpoint version too low" / "Start peer connection failed")**: means the controlled endpoint has no active terminal session, or the two ends have mismatched UU versions. Ask the user to open a UU terminal window on the remote Windows (wait a moment after a P2P restart), then retry. The plugin scans both stdout and stderr for these keywords and returns `handshakeUnavailable` instead of hanging until timeout.
+- **Terminal handshake failure ("controlled endpoint version too low" / "Start peer connection failed")**: means the controlled endpoint has no active terminal session, or the two ends have mismatched UU versions. Ask the user to open a UU terminal window on the remote Windows (wait a moment after a P2P restart), then retry. The plugin scans both stdout and stderr for these keywords, returns `handshakeUnavailable`, and (by default) **auto-retries once with backoff** instead of hanging until timeout.
+- **`terminal_bridge_unavailable`**: the chosen shell isn't supported by the remote terminal bridge — most often when `shell: cmd` is requested. The plugin auto-falls back to `powershell`. If you explicitly need `cmd`, confirm the controlled endpoint actually supports it.
 - ⚠️ `password` appears in cordis.yml and conversation logs; remind the user to change it after use.
 
 ## Architecture
@@ -178,18 +188,28 @@ UUY_CLI=D:/uu/GameViewer/bin/uuyc-cli.exe UUY_DEVICE=<设备ID> node scripts/e2e
   name: '@deepseek-ai/dsh-uuyc'
   disabled: !!js process.platform !== 'win32'   # 仅 Windows 主控端启用
   config:
-    cliPath: ''                  # 留空→自动查找 D:\uu / D:\Netease / C:\Program Files\Netease 等
+    cliPath: ''                  # 留空→依次探测 PATH(`where`)、运行中的 GameViewer.exe 同目录、常见安装目录
     defaultShell: powershell      # powershell | cmd
     execTimeoutMs: 120000
     controlTimeoutMs: 15000
     sessionIdleTtlMs: 600000
     password: ''                 # 可选：被锁屏设备的解锁密码，作为 stdin 首行发送
+    handshakeRetries: 1          # 握手失败时自动重试次数（总尝试 = 1 + 该值）
+    handshakeBackoffMs: 1500     # 退避基数（毫秒），第 n 次重试等待 backoffMs * n
 ```
+
+### 内置的工作流加固
+
+- **CLI 路径自动发现**：`cliPath` 留空时，插件按序探测：显式配置 → PATH 上的 `where uuyc-cli.exe` → 正在运行的 `GameViewer.exe` 同目录 `bin\uuyc-cli.exe` → 一堆常见安装目录（`D:\uu`、`D:\Netease`、`C:\Program Files\NetEase` 等）。多数情况下无需手动配置 `cliPath`。
+- **设备列表缓存 + 模糊匹配**：`device list` 结果缓存 60s；`target` 接受设备名或设备 ID，大小写不敏感，并支持子串模糊匹配。若模糊匹配命中多台设备，插件会列出候选清单而非盲目猜测。
+- **握手自动重试**：命中 `handshakeUnavailable` 时，插件按退避策略重试最多 `handshakeRetries` 次（握手失败多为瞬态——被控端无活跃终端，或 P2P 刚重启）。
+- **Shell 自动回退**：若默认 `powershell` 持续握手失败，插件会用 `cmd` 回退重试一次；若 `cmd` 触发 `terminal_bridge_unavailable`，则回退到受支持的 `powershell`。
 
 ## 被锁屏 / 握手失败的排错
 
 - **锁屏**：被控端锁屏时 `term` 会交互式索要解锁密码。两种方式：(1) 先在远端解锁屏幕；(2) 在配置里填 `password`，插件会把密码作为 stdin 首行发送。若既未解锁也未配 `password`，uuyc 会在 PTY 上一直等密码，本插件表现为**执行超时**（不崩溃，可重试）——这是预期的优雅失败。
-- **终端握手失败（"被控端版本过低" / "Start peer connection failed"）**：说明被控端当前没有活跃终端会话，或两端 UU 版本不匹配。让用户在远程 Windows 上打开一个 UU 终端窗口（P2P 刚重启则稍等片刻），再重试即可。插件会扫描 stdout + stderr 中的这些关键词，命中即返回 `handshakeUnavailable`，无需等到超时。
+- **终端握手失败（"被控端版本过低" / "Start peer connection failed"）**：说明被控端当前没有活跃终端会话，或两端 UU 版本不匹配。让用户在远程 Windows 上打开一个 UU 终端窗口（P2P 刚重启则稍等片刻），再重试即可。插件会扫描 stdout + stderr 中的这些关键词，命中即返回 `handshakeUnavailable`，并（默认）**按退避自动重试一次**，无需等到超时。
+- **`terminal_bridge_unavailable`**：所选 shell 不被远程终端桥支持——多见于显式指定 `shell: cmd`。插件会自动回退到 `powershell`；若确实需要 `cmd`，请先确认被控端确实支持。
 - ⚠️ `password` 会出现在 cordis.yml 与对话记录里，使用后应提醒用户修改密码。
 
 ## 架构位置
