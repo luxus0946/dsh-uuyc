@@ -1,0 +1,14 @@
+# dsh-uuyc 独立 bundle patch。
+# DSH 安装本 bundle 时，会把下面这行插件挂载进宿主 profile。
+# uuyc 的 term 仅支持 Windows 被控端，故非 win32 平台直接 disabled。
+- insert:
+    - id: uuyc
+      name: '@deepseek-ai/dsh-uuyc'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        cliPath: ''
+        defaultShell: powershell
+        execTimeoutMs: 120000
+        controlTimeoutMs: 15000
+        sessionIdleTtlMs: 600000
+        password: ''
