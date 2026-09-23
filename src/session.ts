@@ -146,7 +146,12 @@ export class UuycTerminal {
     const stripped = stripAnsi(this.buffer)
     const errStripped = stripAnsi(this.errBuffer)
     const combined = stripped + errStripped
-    // 锁屏 / 桥不可用：未等到哨兵，但命中提示 → 明确失败，不干等。
+    // 终端桥不可用：多见于向不支持的 shell（如 cmd）发起会话，应回退 powershell。
+    // 必须在锁屏判断之前，因为 'terminal_bridge_unavailable' 也出现在 LOCK_HINTS。
+    if (combined.includes('terminal_bridge_unavailable')) {
+      return { stdout: stripped, stderr: errStripped, exitCode: null, timedOut: false, bridgeUnavailable: true }
+    }
+    // 锁屏：未等到哨兵，但命中提示 → 明确失败，不干等。
     if (hasLockHint(combined)) {
       return { stdout: stripped, stderr: errStripped, exitCode: null, timedOut: false, locked: true }
     }
@@ -181,8 +186,37 @@ export class UuycTerminal {
 }
 
 /**
+ * Run a command with automatic handshake-failure retry. Handshake failures are
+ * usually transient (no active terminal session on the controlled end, or a
+ * freshly restarted P2P link), so recreating the terminal and waiting a bit
+ * often recovers. Returns both the final result and the (possibly recreated)
+ * terminal so the caller can keep using it for stateful sessions.
+ */
+async function runWithHandshakeRetry(
+  make: () => UuycTerminal,
+  command: string,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  maxRetries: number,
+  backoffMs: number,
+): Promise<{ execResult: UuycExecResult; terminal: UuycTerminal }> {
+  let terminal = make()
+  let execResult = await terminal.run(command, timeoutMs, signal)
+  for (let attempt = 0; attempt < maxRetries && execResult.handshakeUnavailable === true; attempt++) {
+    terminal.kill()
+    await sleep(backoffMs * (attempt + 1))
+    terminal = make()
+    execResult = await terminal.run(command, timeoutMs, signal)
+  }
+  return { execResult, terminal }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
  * Ephemeral one-shot execution: open a session, run a single command, then kill
- * it. Convenient default for stateless remote command runs.
+ * it. Convenient default for stateless remote command runs. Automatically
+ * retries on handshake failure (see {@link runWithHandshakeRetry}).
  */
 export async function execOnce(
   cliPath: string,
@@ -192,11 +226,17 @@ export async function execOnce(
   timeoutMs: number,
   password = '',
   signal?: AbortSignal,
+  maxRetries = 1,
+  backoffMs = 1500,
 ): Promise<UuycExecResult> {
-  const terminal = new UuycTerminal(cliPath, target, shell, password)
-  try {
-    return await terminal.run(command, timeoutMs, signal)
-  } finally {
-    terminal.kill()
-  }
+  const { execResult, terminal } = await runWithHandshakeRetry(
+    () => new UuycTerminal(cliPath, target, shell, password),
+    command,
+    timeoutMs,
+    signal,
+    maxRetries,
+    backoffMs,
+  )
+  terminal.kill()
+  return execResult
 }
