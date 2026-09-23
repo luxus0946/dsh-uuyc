@@ -5,7 +5,7 @@
  * @module @deepseek-ai/dsh-uuyc/uuyc
  */
 
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
@@ -34,8 +34,11 @@ export class UuycExitError extends Error {
 
 /** 设备离线或不存在。 */
 export class UuycDeviceNotFoundError extends Error {
-  constructor(public readonly target: string) {
-    super(`未找到设备 "${target}"（离线或不存在，或 target 既非设备名也非设备 ID）。`)
+  constructor(public readonly target: string, public readonly detail?: string) {
+    super(
+      `未找到设备 "${target}"（离线或不存在，或 target 既非设备名也非设备 ID）。` +
+      (detail ? ` ${detail}` : ''),
+    )
     this.name = 'UuycDeviceNotFoundError'
   }
 }
@@ -87,7 +90,50 @@ export function hasHandshakeHint(text: string): boolean {
 }
 
 /**
- * 解析 uuyc-cli.exe 路径：优先用配置值（存在即可），否则按常见安装位置依次回退。
+ * 用系统 `where` 命令定位 PATH 上的 uuyc-cli.exe（Windows 才有效）。
+ * 仅作补充探测：命中即返回，不命中返回 undefined 由后续候选兜底。
+ */
+function tryWhere(): string | undefined {
+  if (process.platform !== 'win32') return undefined
+  try {
+    const out = execFileSync('where', ['uuyc-cli.exe'], { windowsHide: true, timeout: 3000 })
+      .toString('utf8')
+    const first = out.split(/\r?\n/).map((s) => s.trim()).find((s) => s.length > 0)
+    return first !== undefined && existsSync(first) ? first : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 通过正在运行的 GameViewer.exe 反查其安装目录，再拼出 `bin\uuyc-cli.exe`。
+ * 比静态候选更稳：只要 UU 远程主程序在跑，就能找到同目录下的 CLI（不受安装路径影响）。
+ */
+function tryGameViewerProcessPath(): string | undefined {
+  if (process.platform !== 'win32') return undefined
+  try {
+    const ps = 'Get-Process GameViewer -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path'
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', ps], {
+      windowsHide: true,
+      timeout: 3000,
+    })
+      .toString('utf8')
+      .trim()
+    if (out.length === 0) return undefined
+    const dir = out.replace(/[^\\/]+$/, '') // GameViewer.exe 所在目录
+    const candidate = `${dir}bin\\uuyc-cli.exe`
+    return existsSync(candidate) ? candidate : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 解析 uuyc-cli.exe 路径，探测优先级：
+ *   1. 配置值（存在即可）；
+ *   2. PATH 上的 `where uuyc-cli.exe`；
+ *   3. 反查正在运行的 GameViewer.exe 同目录 `bin\uuyc-cli.exe`；
+ *   4. 常见静态安装位置（D:\uu / D:\Netease / C:\Program Files\NetEase …）。
  * 真实安装位置因机器而异：本机实测为 `D:\uu\GameViewer\bin\uuyc-cli.exe`，
  * 文档曾记录 `D:\Netease\...`，默认装在 `C:\Program Files\NetEase\...`，所以都试一遍。
  */
@@ -95,9 +141,16 @@ export function resolveCliPath(configured?: string): string {
   if (configured !== undefined && configured.length > 0 && existsSync(configured)) {
     return configured
   }
+  if (process.platform === 'win32') {
+    const where = tryWhere()
+    if (where !== undefined) return where
+    const fromProcess = tryGameViewerProcessPath()
+    if (fromProcess !== undefined) return fromProcess
+  }
   const candidates = [
     'D:\\uu\\GameViewer\\bin\\uuyc-cli.exe',
     'D:\\Netease\\GameViewer\\bin\\uuyc-cli.exe',
+    'C:\\Program Files\\GameViewer\\bin\\uuyc-cli.exe',
     'C:\\Program Files\\NetEase\\GameViewer\\bin\\uuyc-cli.exe',
     'C:\\Program Files (x86)\\NetEase\\GameViewer\\bin\\uuyc-cli.exe',
   ]
@@ -119,7 +172,13 @@ interface CliResult {
  * via {@link ensureRunning} where the doc says the client must be up.
  */
 export class UuycCli {
-  constructor(private readonly cliPath: string) {}
+  private deviceCache: { devices: UuycDevice[]; at: number } | undefined
+
+  constructor(
+    private readonly cliPath: string,
+    /** 设备列表缓存有效期（毫秒），避免每次 resolveDeviceId 都重新拉取。默认 60s。 */
+    private readonly deviceCacheTtlMs = 60_000,
+  ) {}
 
   /** Execute the CLI and normalize its outcome, including timeout/kill. */
   private async run(args: readonly string[], timeoutMs: number): Promise<CliResult> {
@@ -175,25 +234,53 @@ export class UuycCli {
   }
 
   /** Parse `device list` JSON into device summaries. */
-  async listDevices(controlTimeoutMs: number): Promise<UuycDevice[]> {
+  async listDevices(controlTimeoutMs: number, useCache = true): Promise<UuycDevice[]> {
+    const now = Date.now()
+    if (useCache && this.deviceCache !== undefined && now - this.deviceCache.at < this.deviceCacheTtlMs) {
+      return this.deviceCache.devices
+    }
     await this.ensureRunning(controlTimeoutMs)
     const r = await this.run(['device', 'list'], controlTimeoutMs)
     if (r.code !== 0) throw new UuycExitError(r.code, r.stderr)
-    return parseDeviceList(r.stdout)
+    const devices = parseDeviceList(r.stdout)
+    this.deviceCache = { devices, at: now }
+    return devices
+  }
+
+  /** Force-clear the cached device list (call after connect/disconnect changes state). */
+  invalidateDeviceCache(): void {
+    this.deviceCache = undefined
   }
 
   /**
    * Resolve a target (device name or ID) to a device ID. 真实 uuyc 设备 ID 形如
    * `aeawr2pspeamriqa`，并不以 `uuyc` 开头；因此这里按「先精确匹配 deviceId，再匹配
-   * deviceName」来解析，而不是用前缀猜测。
+   * deviceName，都没有再大小写不敏感子串模糊匹配」来解析，而不是用前缀猜测。
+   * 模糊匹配若命中多台设备会给出候选清单，避免误连。
    */
-  async resolveDeviceId(target: string, controlTimeoutMs: number): Promise<UuycDeviceId> {
-    const devices = await this.listDevices(controlTimeoutMs)
-    const byId = devices.find((d) => d.deviceId === target)
+  async resolveDeviceId(target: string, controlTimeoutMs: number, useCache = true): Promise<UuycDeviceId> {
+    const devices = await this.listDevices(controlTimeoutMs, useCache)
+    const t = target.trim()
+    const tLower = t.toLowerCase()
+    // 1) 精确匹配设备 ID（大小写不敏感，真实 ID 全小写）。
+    const byId = devices.find((d) => d.deviceId.toLowerCase() === tLower)
     if (byId !== undefined) return byId.deviceId
-    const byName = devices.find((d) => d.deviceName === target)
+    // 2) 精确匹配设备名（大小写不敏感）。
+    const byName = devices.find((d) => d.deviceName.toLowerCase() === tLower)
     if (byName !== undefined) return byName.deviceId
-    throw new UuycDeviceNotFoundError(target)
+    // 3) 模糊子串匹配（设备名或 ID 包含 target，大小写不敏感）。
+    const fuzzy = devices.filter(
+      (d) => d.deviceName.toLowerCase().includes(tLower) || d.deviceId.toLowerCase().includes(tLower),
+    )
+    if (fuzzy.length === 1) return fuzzy[0]!.deviceId
+    if (fuzzy.length > 1) {
+      const list = fuzzy.map((d) => `${d.deviceName} (${d.deviceId})`).join('、')
+      throw new UuycDeviceNotFoundError(
+        t,
+        `命中多台设备，请更精确指定其一：${list}`,
+      )
+    }
+    throw new UuycDeviceNotFoundError(t)
   }
 
   /** `device connect <id>` — requires an ID (never a bare name). */
@@ -201,6 +288,7 @@ export class UuycCli {
     await this.ensureRunning(controlTimeoutMs)
     const r = await this.run(['device', 'connect', deviceId], controlTimeoutMs)
     if (r.code !== 0) throw new UuycExitError(r.code, r.stderr)
+    this.invalidateDeviceCache()
   }
 
   /**
@@ -211,6 +299,7 @@ export class UuycCli {
     await this.ensureRunning(controlTimeoutMs)
     const r = await this.run(['device', 'disconnect', deviceId], controlTimeoutMs)
     if (r.code !== 0) throw new UuycExitError(r.code, r.stderr)
+    this.invalidateDeviceCache()
   }
 
   /** `term <target> --list-sessions` — returns raw session list text. target 为已解析的设备 ID。 */
