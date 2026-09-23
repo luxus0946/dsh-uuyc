@@ -21,7 +21,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { TerminalCallView, ToolResultView } from '@deepseek-ai/dsh-tools'
 import { UuycCli, isUuycShell, resolveCliPath } from './uuyc.ts'
 import { execOnce, UuycTerminal } from './session.ts'
-import type { UuycConfig, UuycLocalSessionId, UuycShell } from './types.ts'
+import type { UuycConfig, UuycExecResult, UuycLocalSessionId, UuycShell } from './types.ts'
 import { brandString } from '@deepseek-ai/dsh-brand'
 
 export const name = 'uuyc'
@@ -41,6 +41,10 @@ export const Config = z.object({
   sessionIdleTtlMs: z.number().default(600_000),
   /** 被控端锁屏时用于解锁的账户密码（可选）。仅锁屏设备需要；会进入 cordis.yml 与对话记录，用后建议改密码。 */
   password: z.string().default(''),
+  /** 终端握手失败时的最大重试次数（默认 1，即总共尝试 2 次）。握手失败多因被控端无活跃终端/P2P 刚重启，退避重试常能自愈。 */
+  handshakeRetries: z.number().default(1),
+  /** 握手重试退避基数（毫秒），第 n 次重试等待 handshakeBackoffMs * n。 */
+  handshakeBackoffMs: z.number().default(1500),
 })
 
 interface UuycToolArgs {
@@ -54,7 +58,10 @@ interface UuycToolArgs {
 
 interface OpenSession {
   terminal: UuycTerminal
+  /** 原始 target（名称或设备 ID），仅用于展示。 */
   target: string
+  /** 已解析的设备 ID（传给 --device-id），重建会话时需要。 */
+  deviceId: string
   shell: UuycShell
   timer: NodeJS.Timeout
 }
@@ -95,6 +102,9 @@ function renderUuyc(value: Record<string, unknown>): string {
       if (value.handshakeUnavailable) {
         return '终端握手失败：被控端可能没有活跃终端会话，或两端 UU 版本不匹配。请在远程 Windows 上打开一个 UU 终端窗口（P2P 刚重启则稍等），然后重试。'
       }
+      if (value.bridgeUnavailable) {
+        return '终端桥不可用（terminal_bridge_unavailable）：当前 shell 不被远程终端桥支持。已自动回退到受支持的默认 shell（powershell）；若仍失败，请确认远程设备终端服务可用，或换用已解锁/在线设备。'
+      }
       const out = (value.stdout as string) ?? ''
       const code = value.exitCode
       const tag = value.timedOut ? ' [timeout]' : code === null ? '' : `\n[exit code: ${code}]`
@@ -134,6 +144,38 @@ function splitExitMarker(text: string): { body: string; exitCode?: number } {
   return { body: text }
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * 执行并做 shell 自动回退：
+ * - 当首选 shell 为 cmd 且命中终端桥不可用（terminal_bridge_unavailable）时，回退到受支持的 powershell；
+ * - 当首选 shell 为 powershell 且握手失败（handshakeUnavailable）时，退避后回退到 cmd 再试一次
+ *   （部分设备/版本下 cmd 桥反而可用，作为尽力恢复）。
+ * 命中回退且备选 shell 成功（无 handshakeUnavailable / bridgeUnavailable）才采用备选结果。
+ */
+async function execWithShellFallback(
+  cliPath: string,
+  deviceId: string,
+  shell: UuycShell,
+  command: string,
+  timeoutMs: number,
+  password: string,
+  signal: AbortSignal | undefined,
+  maxRetries: number,
+  backoffMs: number,
+): Promise<UuycExecResult> {
+  let result = await execOnce(cliPath, deviceId, shell, command, timeoutMs, password, signal, maxRetries, backoffMs)
+  const alternate: UuycShell = shell === 'powershell' ? 'cmd' : 'powershell'
+  const shouldFallback =
+    (shell === 'cmd' && result.bridgeUnavailable === true) ||
+    (shell === 'powershell' && result.handshakeUnavailable === true)
+  if (shouldFallback) {
+    const alt = await execOnce(cliPath, deviceId, alternate, command, timeoutMs, password, signal, maxRetries, backoffMs)
+    if (alt.handshakeUnavailable !== true && alt.bridgeUnavailable !== true) result = alt
+  }
+  return result
+}
+
 export function apply(ctx: Context, config: UuycConfig): void {
   const defaultShell = isUuycShell(config.defaultShell) ? config.defaultShell : 'powershell'
   const cliPath = resolveCliPath(config.cliPath)
@@ -157,6 +199,8 @@ export function apply(ctx: Context, config: UuycConfig): void {
       + ' 被控端锁屏时需要先在远端解锁（或配置 password 由插件发送解锁密码）才能执行命令；'
       + ' 若报"终端握手失败/被控端版本过低"，通常是因为被控端没有活跃终端窗口，让用户在远端打开一个 UU 终端窗口后重试。'
       + ' 断开连接必须指定设备，避免误断全部连接。'
+      + ' 终端握手失败会自动退避重试（次数由 handshakeRetries 控制），powershell 握手失败时还会回退到 cmd 再试；'
+      + ' 用 cmd 触发 terminal_bridge_unavailable 时会自动回退到受支持的 powershell。target 支持名称/设备ID的模糊匹配。'
       + ' ⚠️ uuyc-cli 无原生文件传输能力，传文件请走 UU 远程客户端的 GUI 互传，不要尝试用本工具传文件。',
     parameters: {
       action: {
@@ -216,15 +260,25 @@ export function apply(ctx: Context, config: UuycConfig): void {
           }
           case 'exec': {
             const deviceId = await cli.resolveDeviceId(args.target as string, config.controlTimeoutMs)
-            const result = await execOnce(cliPath, deviceId, shell, args.command as string, timeoutMs, config.password, exec.signal)
-            return { ...result, action: 'exec', ok: !result.timedOut && !result.locked && !result.handshakeUnavailable }
+            const result = await execWithShellFallback(
+              cliPath,
+              deviceId,
+              shell,
+              args.command as string,
+              timeoutMs,
+              config.password,
+              exec.signal,
+              config.handshakeRetries,
+              config.handshakeBackoffMs,
+            )
+            return { ...result, action: 'exec', ok: !result.timedOut && !result.locked && !result.handshakeUnavailable && !result.bridgeUnavailable }
           }
           case 'open_session': {
             const deviceId = await cli.resolveDeviceId(args.target as string, config.controlTimeoutMs)
             const terminal = new UuycTerminal(cliPath, deviceId, shell, config.password)
             const id = brandString<UuycLocalSessionId>(randomUUID())
             const timer = setTimeout(() => clearSession(id), config.sessionIdleTtlMs)
-            sessions.set(id, { terminal, target: args.target as string, shell, timer })
+            sessions.set(id, { terminal, target: args.target as string, deviceId, shell, timer })
             return { action: 'open_session', ok: true, session_id: id, message: `已开启会话 ${id}（空闲 ${config.sessionIdleTtlMs}ms 后自动回收）` }
           }
           case 'run_in_session': {
@@ -232,9 +286,40 @@ export function apply(ctx: Context, config: UuycConfig): void {
             const entry = sessions.get(sessionId)
             if (entry === undefined) throw new Error(`会话 ${sessionId} 不存在或已回收`)
             clearTimeout(entry.timer)
-            const result = await entry.terminal.run(args.command as string, timeoutMs, exec.signal)
+            const command = args.command as string
+            let result = await entry.terminal.run(command, timeoutMs, exec.signal)
+            // 握手失败：先在同 shell 内退避重试，仍失败且当前为 powershell 时回退到 cmd 再试。
+            if (result.handshakeUnavailable === true) {
+              let attempt = 0
+              while (result.handshakeUnavailable === true && attempt < config.handshakeRetries) {
+                entry.terminal.kill()
+                await sleep(config.handshakeBackoffMs * (attempt + 1))
+                entry.terminal = new UuycTerminal(cliPath, entry.deviceId, entry.shell, config.password)
+                result = await entry.terminal.run(command, timeoutMs, exec.signal)
+                attempt++
+              }
+              if (result.handshakeUnavailable === true && entry.shell === 'powershell') {
+                entry.terminal.kill()
+                const altShell: UuycShell = 'cmd'
+                let altTerminal = new UuycTerminal(cliPath, entry.deviceId, altShell, config.password)
+                let altResult = await altTerminal.run(command, timeoutMs, exec.signal)
+                let a2 = 0
+                while (altResult.handshakeUnavailable === true && a2 < config.handshakeRetries) {
+                  altTerminal.kill()
+                  await sleep(config.handshakeBackoffMs * (a2 + 1))
+                  altTerminal = new UuycTerminal(cliPath, entry.deviceId, altShell, config.password)
+                  altResult = await altTerminal.run(command, timeoutMs, exec.signal)
+                  a2++
+                }
+                if (altResult.handshakeUnavailable !== true && altResult.bridgeUnavailable !== true) {
+                  result = altResult
+                  entry.shell = altShell
+                }
+                entry.terminal = altTerminal
+              }
+            }
             entry.timer = setTimeout(() => clearSession(sessionId), config.sessionIdleTtlMs)
-            return { ...result, action: 'run_in_session', ok: !result.timedOut && !result.handshakeUnavailable, session_id: sessionId }
+            return { ...result, action: 'run_in_session', ok: !result.timedOut && !result.handshakeUnavailable && !result.bridgeUnavailable, session_id: sessionId }
           }
           case 'kill_session': {
             clearSession(args.session_id as string)
