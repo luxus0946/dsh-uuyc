@@ -1,11 +1,116 @@
 ---
-description: "UU 远程 (uuyc-cli) 远程 Windows 控制插件：设备管理与远程终端执行"
+description: "UU remote (uuyc-cli) Windows remote-control plugin for deepseek-harness: device management and remote terminal execution"
 kind: "package"
 ---
 
-# dsh-uuyc — UU 远程远程 Windows 控制插件
+# dsh-uuyc — UU Remote Windows Control Plugin
 
-English | 中文
+[English](#english) | [中文](#中文)
+
+<a id="english"></a>
+
+Control remote Windows machines through NetEase UU Remote's `uuyc-cli`: list / connect / disconnect devices and run commands in a remote terminal. This plugin only **spawns `uuyc-cli.exe` locally and parses its output**; authentication and networking are handled by the logged-in UU Remote desktop client.
+
+> **Platform limitation**: `uuyc-cli`'s `term` remote terminal **only supports Windows controlled endpoints**. For remote Linux servers, use the harness's native SSH backend, not this plugin.
+
+## Installation (as a DSH bundle)
+
+This repository is a **self-contained installable bundle**. Others don't need to clone the source or pull the whole deepseek-harness monorepo — they install it into their own DSH profile with one command:
+
+```bash
+dsh plugin --profile <your-profile> add github:luxus0946/dsh-uuyc
+```
+
+What happens: DSH clones this repo → runs `pnpm install` → runs the `prepare` script (tsdown) to compile `src/` into a self-contained `lib/` → mounts the `uuyc` plugin into the profile according to `cordis.patch.yml`.
+
+> **pnpm ≥ 10 requires build-script approval**: pnpm 10 blocks dependency `prepare`/build scripts by default. If you see "ignored build scripts" on first install, grant `allowBuilds` for `@deepseek-ai/*` and this package, otherwise `lib/` won't be generated and the plugin won't load.
+>
+> **Windows only**: `cordis.patch.yml` sets `disabled: !!js process.platform !== 'win32'`, so non-Windows hosts skip this plugin automatically (uuyc `term` only supports Windows controlled endpoints).
+
+### Other distribution methods
+
+- **npm**: `pnpm publish` (configured with `prepublishOnly` to build `lib/` first), then `dsh plugin add @deepseek-ai/dsh-uuyc`.
+- **tarball**: `pnpm pack` produces `dsh-uuyc-*.tgz`, then `dsh plugin add ./dsh-uuyc-*.tgz`.
+
+## Development: local build & end-to-end test
+
+```bash
+pnpm install        # install @deepseek-ai/* runtime (peers, provided by host; here only for build/typecheck)
+pnpm build          # tsdown: src/*.ts → single lib/index.js (ESM) + lib/index.d.ts
+pnpm typecheck      # tsc --noEmit
+```
+
+End-to-end test against a real device (UU Remote installed & logged in, controlled device online):
+
+```bash
+pnpm build
+UUY_CLI=D:/uu/GameViewer/bin/uuyc-cli.exe UUY_DEVICE=<device-id> node scripts/e2e-real.mjs
+```
+
+## Features
+
+The model-visible tool `uuyc_terminal`, dispatched by `action`:
+
+| action | description |
+|---|---|
+| `list_devices` | List devices under the account (name / device ID / online status) |
+| `connect` | Connect to a device (requires device ID; name is resolved automatically) |
+| `disconnect` | Disconnect (ID required — never disconnects everything by accident) |
+| `exec` | One-shot session: open → run command → close, returns stdout / exit code |
+| `open_session` | Open a stateful session, returns `session_id` (idle auto-recycle) |
+| `run_in_session` | Run one command in a given session |
+| `kill_session` | Close a given session |
+| `list_sessions` | List uuyc terminal sessions of a device |
+
+## Prerequisites (important)
+
+- **UU Remote desktop client must be running and logged in**, otherwise `exec`/`connect` etc. return exit code 2 and this plugin reports a clear hint.
+- `uuyc-cli.exe` is not in a fixed location: on the author's machine it is `D:\uu\GameViewer\bin\uuyc-cli.exe`; docs also recorded `D:\Netease\GameViewer\bin\uuyc-cli.exe`, and the default install is `C:\Program Files\NetEase\GameViewer\bin\uuyc-cli.exe`. **Leave `cliPath` empty** and the plugin probes the candidate list in order; if none exist, set it explicitly in cordis.yml.
+- **⚠️ No native file transfer**: `uuyc-cli`'s command surface (`version/user/device/cloudpc/echo/term/lterm/input-diag`) has no file-transfer subcommand. The `--upload`/`--pycode` flags seen online belong to the upper-layer `uu.py` wrapper, and base64 line-wrapping is unreliable. Transfer files via UU Remote's GUI, not this tool.
+
+## Configuration (cordis.yml / profile patch)
+
+```yaml
+- id: uuyc
+  name: '@deepseek-ai/dsh-uuyc'
+  disabled: !!js process.platform !== 'win32'   # enable only on Windows host
+  config:
+    cliPath: ''                  # empty → auto-detect D:\uu / D:\Netease / C:\Program Files\Netease etc.
+    defaultShell: powershell      # powershell | cmd
+    execTimeoutMs: 120000
+    controlTimeoutMs: 15000
+    sessionIdleTtlMs: 600000
+    password: ''                 # optional: unlock password for locked devices, sent as first stdin line
+```
+
+## Troubleshooting: locked screen / handshake failure
+
+- **Locked screen**: when the controlled endpoint is locked, `term` interactively asks for the unlock password. Two options: (1) unlock the screen on the remote first; (2) set `password` in config and the plugin sends it as the first stdin line. If neither, uuyc waits for the password on the PTY and the plugin times out (no crash, retry-able) — this is the expected graceful failure.
+- **Terminal handshake failure ("controlled endpoint version too low" / "Start peer connection failed")**: means the controlled endpoint has no active terminal session, or the two ends have mismatched UU versions. Ask the user to open a UU terminal window on the remote Windows (wait a moment after a P2P restart), then retry. The plugin scans both stdout and stderr for these keywords and returns `handshakeUnavailable` instead of hanging until timeout.
+- ⚠️ `password` appears in cordis.yml and conversation logs; remind the user to change it after use.
+
+## Architecture
+
+- `src/uuyc.ts` — `uuyc-cli` wrapper: health check, device-list parsing, connect/disconnect, exit-code mapping.
+- `src/session.ts` — `term` interactive session driver: sentinel detection, output cleaning (ANSI / echo stripping), exit-code parsing.
+- `src/index.ts` — plugin entry: registers the `uuyc_terminal` tool, maintains the stateful session table, wires cancellation signals and idle recycle.
+- `cordis.patch.yml` — bundle mount declaration, applied by the host when `dsh plugin add` runs.
+
+## Known Limitations and Deferred Work
+
+- **`term` is a session-style PTY**: there is no native "run one command and return" semantics. `session.ts` uses the sentinel `__UUYCDONE__<code>__` to split output and strip echoed lines; the interactive prompt / echo / encoding varies by shell and locale and **must be tuned on real hardware** (especially `UuycTerminal.wrap`'s sentinel writing).
+- **Depends on the UU Remote desktop client**: when the client is not running / logged in, all commands return exit code 2; the plugin can only report and guide, not bypass.
+- **No Linux support**: uuyc `term` only supports Windows controlled endpoints; Linux terminal servers are out of scope (see Platform limitation above).
+- **`disconnect` without ID is global**: underlying semantics risk; this plugin enforces an ID to avoid it, but it must be continuously covered in docs and tests.
+- **No native file transfer**: the CLI has no file-transfer subcommand; use UU Remote's GUI (see Prerequisites).
+- **Lock-screen password is optional**: the `password` config is only needed for locked devices; leave empty for unlocked ones; the send logic is "first stdin line" and should be verified once on a locked real device.
+- **End-to-end test done on real hardware**: `listDevices` + `execOnce` (powershell / native command) passed on device `便携`; full typecheck passed; handshake-failure / lock-screen password injection still need verification on a locked real device.
+
+---
+
+<a id="中文"></a>
+
+# dsh-uuyc — UU 远程远程 Windows 控制插件（中文）
 
 通过 [网易 UU 远程](https://uuyc.163.com/) 的 `uuyc-cli` 控制远程 Windows 设备：列出/连接/断开设备，并在远程终端执行命令。本插件只负责**本地调起 `uuyc-cli.exe` 并解析其结果**，认证与网络由已登录的 UU 远程主客户端承担。
 
@@ -63,7 +168,7 @@ UUY_CLI=D:/uu/GameViewer/bin/uuyc-cli.exe UUY_DEVICE=<设备ID> node scripts/e2e
 ## 运行前提（重要）
 
 - **UU 远程主客户端必须已运行并登录**，否则 `exec`/`connect` 等返回退出码 2，本插件会给出明确指引。
-- `uuyc-cli.exe` 不在固定位置：本机实测为 `D:\uu\GameViewer\bin\uuyc-cli.exe`，文档也曾记录 `D:\Netease\GameViewer\bin\uuyc-cli.exe`，默认安装在 `C:\Program Files\NetEase\GameViewer\bin\uuyc-cli.exe`。**配置 `cliPath` 留空即可**，插件会按这份候选清单依次查找第一个存在的路径；若都不存在再在 cordis.yml 显式指定。
+- `uuyc-cli.exe` 不在固定位置：本机实测为 `D:\uu\GameViewer\bin\uuyc-cli.exe`，文档也曾记录 `D:\Netease\GameViewer\bin\uuyc-cli.exe`，默认安装在 `C:\Program Files\Netease\GameViewer\bin\uuyc-cli.exe`。**配置 `cliPath` 留空即可**，插件会按这份候选清单依次查找第一个存在的路径；若都不存在再在 cordis.yml 显式指定。
 - **⚠️ 无原生文件传输**：`uuyc-cli` 的命令面（`version/user/device/cloudpc/echo/term/lterm/input-diag`）不包含任何文件传输子命令，网上流传的 `--upload`/`--pycode` 都是上层 `uu.py` 封装的参数，且 base64 折行不可靠。传文件请走 UU 远程客户端的 GUI 互传，不要尝试用本工具传文件。
 
 ## 配置（cordis.yml / profile patch）
@@ -73,7 +178,7 @@ UUY_CLI=D:/uu/GameViewer/bin/uuyc-cli.exe UUY_DEVICE=<设备ID> node scripts/e2e
   name: '@deepseek-ai/dsh-uuyc'
   disabled: !!js process.platform !== 'win32'   # 仅 Windows 主控端启用
   config:
-    cliPath: ''                  # 留空→自动查找 D:\uu / D:\Netease / C:\Program Files\NetEase 等
+    cliPath: ''                  # 留空→自动查找 D:\uu / D:\Netease / C:\Program Files\Netease 等
     defaultShell: powershell      # powershell | cmd
     execTimeoutMs: 120000
     controlTimeoutMs: 15000
@@ -94,7 +199,7 @@ UUY_CLI=D:/uu/GameViewer/bin/uuyc-cli.exe UUY_DEVICE=<设备ID> node scripts/e2e
 - `src/index.ts` — 插件入口：注册 `uuyc_terminal` 工具、维护有状态会话表、接入取消信号与空闲回收。
 - `cordis.patch.yml` — 组合包挂载声明，`dsh plugin add` 时由宿主应用。
 
-## Known Limitations and Deferred Work
+## 已知限制与待办工作
 
 - **`term` 为会话式 PTY**：没有原生"执行一条命令并返回"语义。`session.ts` 用哨兵串 `__UUYCDONE__<code>__` 切分输出并剥离回显行；交互式终端的提示符/回显/编码因 shell 与区域而异，**必须在真机上调优**（尤其 `UuycTerminal.wrap` 的哨兵写法）。
 - **依赖 UU 远程主程序**：主程序未运行/未登录时全部命令退出码 2，插件只能报错指引，无法绕过。
