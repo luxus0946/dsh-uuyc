@@ -1,7 +1,12 @@
 node_modules/
-lib/
 *.tsbuildinfo
 .DS_Store
 dist/
 package-lock.json
 pnpm-lock.yaml
+*.tgz
+
+# lib/ is intentionally NOT ignored: it is committed so a GitHub-source install
+# never has to build. The build-time deps (@deepseek-ai/*) are host-provided and
+# are not published on the public registry, so a `prepare` build would fail for
+# anyone installing straight from this repository.

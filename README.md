@@ -15,15 +15,15 @@ Control remote Windows machines through NetEase UU Remote's `uuyc-cli`: list / c
 
 ## Installation (as a DSH bundle)
 
-This repository is a **self-contained installable bundle**. Others don't need to clone the source or pull the whole deepseek-harness monorepo — they install it into their own DSH profile with one command:
+Install it into your own DSH profile with one command:
 
 ```bash
 dsh plugin --profile <your-profile> add github:luxus0946/dsh-uuyc
 ```
 
-What happens: DSH clones this repo → runs `pnpm install` → runs the `prepare` script (tsdown) to compile `src/` into a self-contained `lib/` → mounts the `uuyc` plugin into the profile according to `cordis.patch.yml`.
+What happens: DSH clones this repo and mounts the `uuyc` plugin into the profile according to `cordis.patch.yml`. **No build step runs** — the compiled `lib/` is committed precisely so that a source install cannot fail (see the prerequisite below).
 
-> **pnpm ≥ 10 requires build-script approval**: pnpm 10 blocks dependency `prepare`/build scripts by default. If you see "ignored build scripts" on first install, grant `allowBuilds` for `@deepseek-ai/*` and this package, otherwise `lib/` won't be generated and the plugin won't load.
+> **Prerequisite — a matching DSH host.** This plugin consumes host-provided peers: it needs a harness that supplies `@deepseek-ai/dsh-tools@^0.1.6-alpha.2`, `@deepseek-ai/dsh-brand@^0.1.6-alpha.2`, `@deepseek-ai/cordis@^4.0.2` and `@deepseek-ai/schemastery@^3.18.2`. The two DeepSeek packages are **not published on the public npm registry** (only `0.0.1-rc.1` is), so the plugin loads only inside a harness build that provides them — a harness source checkout or an internal build. Someone who only has the public `dsh` cannot use it.
 >
 > **Windows only**: `cordis.patch.yml` sets `disabled: !!js process.platform !== 'win32'`, so non-Windows hosts skip this plugin automatically (uuyc `term` only supports Windows controlled endpoints).
 
@@ -35,10 +35,11 @@ What happens: DSH clones this repo → runs `pnpm install` → runs the `prepare
 ## Development: local build & end-to-end test
 
 ```bash
-pnpm install        # install @deepseek-ai/* runtime (peers, provided by host; here only for build/typecheck)
 pnpm build          # tsdown: src/*.ts → single lib/index.js (ESM) + lib/index.d.ts
-pnpm typecheck      # tsc --noEmit
+pnpm typecheck      # tsc --noEmit (requires the @deepseek-ai/* peers; see note)
 ```
+
+> `pnpm install` cannot fetch the peers on its own — `@deepseek-ai/dsh-tools` and `dsh-brand` are not on the public registry. Point `node_modules/@deepseek-ai/` at a local harness (or use a workspace install) before running `typecheck`. `pnpm build` does not need them: the peers are marked external, so only `typecheck` depends on their type declarations.
 
 End-to-end test against a real device (UU Remote installed & logged in, controlled device online):
 
@@ -128,15 +129,15 @@ The model-visible tool `uuyc_terminal`, dispatched by `action`:
 
 ## 安装（作为 DSH 组合包 / bundle）
 
-本仓库是一个**自包含的可安装 bundle**：别人无需克隆源码、无需把整个 deepseek-harness monorepo 拉下来，直接用一行命令装进自己的 DSH profile：
+直接用一行命令装进自己的 DSH profile：
 
 ```bash
 dsh plugin --profile <你的profile> add github:luxus0946/dsh-uuyc
 ```
 
-安装过程：DSH 会从 GitHub 拉取本仓库 → 执行 `pnpm install` → 跑 `prepare` 脚本（即 `tsdown`）把 `src/` 编译成自包含的 `lib/` → 按 `cordis.patch.yml` 把 `uuyc` 插件挂载进 profile。
+安装过程：DSH 从 GitHub 拉取本仓库，按 `cordis.patch.yml` 把 `uuyc` 插件挂载进 profile。**不再执行任何构建**——编译产物 `lib/` 已随仓库提交，这样源安装就不会失败（前置条件见下）。
 
-> **pnpm ≥ 10 需授权构建脚本**：pnpm 10 默认禁止自动执行依赖的 `prepare`/构建脚本。首次安装若提示 "ignored build scripts"，请对 `@deepseek-ai/*` 与本项目授予 `allowBuilds`（或在安装时按提示选择允许），否则 `lib/` 不会生成、插件加载会失败。
+> **前置条件：宿主版本需匹配。** 本插件消费宿主提供的 peer，要求宿主提供 `@deepseek-ai/dsh-tools@^0.1.6-alpha.2`、`@deepseek-ai/dsh-brand@^0.1.6-alpha.2`、`@deepseek-ai/cordis@^4.0.2`、`@deepseek-ai/schemastery@^3.18.2`。其中 dsh-tools / dsh-brand **未发布到公共 npm**（公共源上只有 `0.0.1-rc.1`），因此本插件只能在提供这些包的 harness 构建内加载 —— 即 harness 源码检出或内部构建版本；仅有公共 `dsh` 的外部用户无法使用。
 >
 > **仅 Windows 生效**：`cordis.patch.yml` 里 `disabled: !!js process.platform !== 'win32'`，非 Windows 主控端会自动跳过本插件（uuyc `term` 只支持 Windows 被控端）。
 
@@ -148,10 +149,11 @@ dsh plugin --profile <你的profile> add github:luxus0946/dsh-uuyc
 ## 开发者：本地构建与联调
 
 ```bash
-pnpm install        # 安装 @deepseek-ai/* 运行时（peer，由宿主提供；此处仅为构建/类型检查）
 pnpm build          # tsdown：src/*.ts → 单文件 lib/index.js（ESM）+ lib/index.d.ts
-pnpm typecheck      # tsc --noEmit 类型检查
+pnpm typecheck      # tsc --noEmit 类型检查（需要 @deepseek-ai/* peer，见下方说明）
 ```
+
+> `pnpm install` 无法自行拉取这些 peer —— `@deepseek-ai/dsh-tools` 与 `dsh-brand` 未发布到公共 npm。跑 `typecheck` 前请把 `node_modules/@deepseek-ai/` 指向本地 harness（或改用 workspace 安装）。`pnpm build` 不需要它们：peer 被标记为 external，只有 `typecheck` 依赖它们的类型声明。
 
 端到端真机联调（需本机装好并登录 UU 远程、被控端在线）：
 

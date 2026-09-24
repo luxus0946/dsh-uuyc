@@ -343,8 +343,6 @@ export function apply(ctx: Context, config: UuycConfig): void {
   }))
 }
 
-export default apply
-
 // 对外暴露底层 API，便于嵌入其它模块或编写端到端测试。
 export { UuycTerminal, execOnce } from './session.ts'
 export {

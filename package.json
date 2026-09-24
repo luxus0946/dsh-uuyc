@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-uuyc",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "UU remote (uuyc-cli) Windows remote-control plugin for deepseek-harness: device management and remote terminal execution for local agents.",
   "type": "module",
   "main": "lib/index.js",
@@ -20,8 +20,7 @@
   "scripts": {
     "build": "tsdown && node scripts/fix-dts.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build",
-    "prepare": "npm run build"
+    "prepublishOnly": "npm run build"
   },
   "dsh": {
     "bundle": {

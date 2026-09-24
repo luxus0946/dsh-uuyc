@@ -14,5 +14,10 @@ export default defineConfig({
   target: 'es2024',
   dts: true,
   clean: true,
+  // 强制输出 .js / .d.ts（而非 ESM 默认的 .mjs / .d.mts），
+  // 与 package.json 的 main/types 约定保持一致，避免宿主按 lib/index.js 解析失败。
+  outExtensions() {
+    return { js: '.js', dts: '.d.ts' }
+  },
   external: [/^@deepseek-ai\//, /^node:/],
 })
